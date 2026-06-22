@@ -326,6 +326,216 @@ def xor_brute(hex_input, max_key=255):
     console.print(table)
 
 
+# ── Multi-byte XOR Crack ─────────────────────────────────
+
+def hamming_distance(b1, b2):
+    return sum(bin(a ^ b).count("1") for a, b in zip(b1, b2))
+
+
+def find_key_length(data, max_len=40):
+    scores = []
+    for kl in range(2, min(max_len + 1, len(data) // 2)):
+        chunks = [data[i:i+kl] for i in range(0, len(data) - kl, kl)]
+        if len(chunks) < 2:
+            continue
+        distances = []
+        for i in range(min(len(chunks) - 1, 6)):
+            d = hamming_distance(chunks[i], chunks[i+1]) / kl
+            distances.append(d)
+        avg = sum(distances) / len(distances)
+        scores.append((kl, avg))
+
+    scores.sort(key=lambda x: x[1])
+    return scores[:5]
+
+
+ENGLISH_WORDS = {
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "i",
+    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+    "this", "but", "his", "by", "from", "they", "we", "say", "her",
+    "she", "or", "an", "will", "my", "one", "all", "would", "there",
+    "their", "what", "so", "up", "out", "if", "about", "who", "get",
+    "which", "go", "me", "when", "make", "can", "like", "time", "no",
+    "just", "him", "know", "take", "people", "into", "year", "your",
+    "good", "some", "could", "them", "see", "other", "than", "then",
+    "now", "look", "only", "come", "its", "over", "think", "also",
+    "back", "after", "use", "two", "how", "our", "work", "first",
+    "well", "way", "even", "new", "want", "because", "any", "these",
+    "give", "day", "most", "us", "is", "was", "are", "has", "had",
+    "flag", "hidden", "secret", "message", "encrypt", "crack", "find",
+}
+
+
+def score_english_raw(text):
+    """Absolute score — for single-byte cracking of short blocks."""
+    freq = {
+        'e': 12.7, 't': 9.1, 'a': 8.2, 'o': 7.5, 'i': 7.0,
+        'n': 6.7, 's': 6.3, 'h': 6.1, 'r': 6.0, 'd': 4.3,
+        'l': 4.0, ' ': 15.0,
+    }
+    score = 0
+    for c in text.lower():
+        if c in freq:
+            score += freq[c]
+        elif not c.isprintable():
+            score -= 50
+    return score
+
+
+def score_english(text):
+    """Smart normalized score — for ranking final plaintext candidates."""
+    if not text:
+        return -999
+
+    raw = score_english_raw(text)
+    score = raw / len(text)
+
+    words = text.lower().split()
+    if words:
+        word_hits = sum(1 for w in words if w.strip(".,!?;:'\"()") in ENGLISH_WORDS)
+        score += (word_hits / len(words)) * 20
+
+    printable_ratio = sum(1 for c in text if c.isprintable()) / len(text)
+    score += printable_ratio * 5
+
+    return score
+
+
+def crack_single_byte_xor(data):
+    best_score = -999999
+    best_key = 0
+    best_text = b""
+    for key in range(256):
+        result = bytes(b ^ key for b in data)
+        try:
+            text = result.decode("ascii")
+            s = score_english_raw(text)
+            if s > best_score:
+                best_score = s
+                best_key = key
+                best_text = result
+        except Exception:
+            pass
+    return best_key, best_text, best_score
+
+
+def xor_crack_multi(hex_input):
+    console.print(f"\n[bold yellow]Multi-byte XOR Crack[/bold yellow]\n")
+
+    try:
+        data = bytes.fromhex(hex_input.replace(" ", ""))
+    except ValueError:
+        console.print("[red]Invalid hex input[/red]")
+        return
+
+    if len(data) < 8:
+        console.print("[red]Input too short for multi-byte analysis (need 8+ bytes)[/red]")
+        return
+
+    console.print(f"  [dim]Ciphertext: {len(data)} bytes[/dim]\n")
+
+    # Step 1: Find key length
+    key_lengths = find_key_length(data)
+
+    kl_table = Table(
+        title="[bold green]Step 1: Key Length Detection (Hamming Distance)[/bold green]",
+        box=box.ROUNDED,
+        border_style="green",
+    )
+    kl_table.add_column("Key Length", style="cyan", justify="center", width=12)
+    kl_table.add_column("Score", style="yellow", width=10)
+    kl_table.add_column("", width=10)
+
+    for i, (kl, score) in enumerate(key_lengths):
+        marker = "[bold green]<< best[/bold green]" if i == 0 else ""
+        kl_table.add_row(str(kl), f"{score:.3f}", marker)
+
+    console.print(kl_table)
+
+    # Step 2: Crack for top key lengths + all small lengths (2-12)
+    console.print(f"\n  [bold blue]Step 2: Cracking candidate key lengths...[/bold blue]\n")
+
+    candidate_lengths = set()
+    for kl, _ in key_lengths[:5]:
+        candidate_lengths.add(kl)
+    for kl in range(2, 13):
+        if kl < len(data) // 2:
+            candidate_lengths.add(kl)
+
+    results = []
+    for kl in sorted(candidate_lengths):
+        key_bytes = []
+        for i in range(kl):
+            block = bytes(data[j] for j in range(i, len(data), kl))
+            best_key, _, _ = crack_single_byte_xor(block)
+            key_bytes.append(best_key)
+
+        full_key = bytes(key_bytes)
+        decrypted = bytes(data[i] ^ full_key[i % kl] for i in range(len(data)))
+
+        try:
+            plaintext = decrypted.decode("ascii")
+            text_score = score_english(plaintext)
+            printable = plaintext.isprintable()
+        except Exception:
+            plaintext = decrypted.decode("utf-8", errors="replace")
+            text_score = -999
+            printable = False
+
+        key_ascii = ""
+        try:
+            key_ascii = full_key.decode("ascii")
+            if not key_ascii.isprintable():
+                key_ascii = ""
+        except Exception:
+            pass
+
+        results.append({
+            "key_len": kl,
+            "key_hex": full_key.hex(),
+            "key_ascii": key_ascii,
+            "plaintext": plaintext,
+            "score": text_score,
+            "printable": printable,
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    result_table = Table(
+        title="[bold green]Step 2: Results[/bold green]",
+        box=box.ROUNDED,
+        border_style="green",
+        show_lines=True,
+    )
+    result_table.add_column("Key Len", style="cyan", justify="center", width=8)
+    result_table.add_column("Key (hex)", style="yellow", width=18)
+    result_table.add_column("Key (ASCII)", style="bold green", width=14)
+    result_table.add_column("Score", style="magenta", justify="right", width=8)
+
+    for r in results:
+        result_table.add_row(
+            str(r["key_len"]),
+            r["key_hex"],
+            r["key_ascii"] or "[dim]-[/dim]",
+            f"{r['score']:.0f}",
+        )
+
+    console.print(result_table)
+
+    # Show best plaintext
+    best = results[0]
+    console.print(Panel(
+        f"[bold]Key:[/bold] [green]{best['key_ascii'] or best['key_hex']}[/green]\n"
+        f"[bold]Key (hex):[/bold] [yellow]{best['key_hex']}[/yellow]\n"
+        f"[bold]Key length:[/bold] [cyan]{best['key_len']}[/cyan]\n\n"
+        f"[bold]Plaintext:[/bold]\n{best['plaintext'][:500]}",
+        title="[bold green]Best Result[/bold green]",
+        border_style="bright_green",
+        box=box.DOUBLE,
+    ))
+    console.print()
+
+
 # ── Frequency Analysis ───────────────────────────────────
 
 def freq_analysis(text):
@@ -493,6 +703,7 @@ def interactive():
         "  [cyan]caesar[/cyan]   <text>              — Brute-force Caesar cipher\n"
         "  [cyan]xor[/cyan]      <text> <key>        — XOR encrypt/decrypt\n"
         "  [cyan]xorbrute[/cyan] <hex>               — Brute-force single-byte XOR\n"
+        "  [cyan]xorcrack[/cyan] <hex>               — Crack multi-byte XOR key\n"
         "  [cyan]freq[/cyan]     <text>              — Frequency analysis\n"
         "  [cyan]password[/cyan] <password>           — Password strength analysis\n"
         "  [cyan]help[/cyan]                          — Show this menu\n"
@@ -537,6 +748,8 @@ def interactive():
                 console.print("[red]Usage: xor <text> <key>[/red]")
         elif action == "xorbrute" and arg:
             xor_brute(arg)
+        elif action == "xorcrack" and arg:
+            xor_crack_multi(arg)
         elif action == "freq" and arg:
             freq_analysis(arg)
         elif action == "password" and arg:
@@ -550,7 +763,8 @@ def interactive():
                 "  [cyan]magic[/cyan]    <text>              — Auto-detect encoding\n"
                 "  [cyan]caesar[/cyan]   <text>              — Caesar brute-force\n"
                 "  [cyan]xor[/cyan]      <text> <key>        — XOR encrypt/decrypt\n"
-                "  [cyan]xorbrute[/cyan] <hex>               — XOR brute-force\n"
+                "  [cyan]xorbrute[/cyan] <hex>               — XOR brute-force (1 byte)\n"
+                "  [cyan]xorcrack[/cyan] <hex>               — XOR crack (multi-byte)\n"
                 "  [cyan]freq[/cyan]     <text>              — Frequency analysis\n"
                 "  [cyan]password[/cyan] <pw>                — Password strength\n"
                 "  [cyan]exit[/cyan]                          — Quit",
@@ -590,8 +804,11 @@ def main():
     x.add_argument("text", help="Text")
     x.add_argument("key", help="XOR key")
 
-    xb = subparsers.add_parser("xorbrute", help="XOR brute-force")
+    xb = subparsers.add_parser("xorbrute", help="XOR single-byte brute-force")
     xb.add_argument("hex_input", help="Hex-encoded ciphertext")
+
+    xc = subparsers.add_parser("xorcrack", help="Crack multi-byte XOR key")
+    xc.add_argument("hex_input", help="Hex-encoded ciphertext")
 
     f = subparsers.add_parser("freq", help="Frequency analysis")
     f.add_argument("text", help="Text to analyze")
@@ -624,6 +841,9 @@ def main():
     elif args.command == "xorbrute":
         console.print(BANNER)
         xor_brute(args.hex_input)
+    elif args.command == "xorcrack":
+        console.print(BANNER)
+        xor_crack_multi(args.hex_input)
     elif args.command == "freq":
         console.print(BANNER)
         freq_analysis(args.text)
